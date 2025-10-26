@@ -42,3 +42,10 @@ The CSV files represent maps where each CSV entry is a chunk on the map:
 ### 5. File Management
 - **Refresh Button**: Reload all CSV files from `/maps` directory
 - **Live Updates**: Allow updating maps while program is running (refresh button)
+
+## GUI Layout Design
+
+### Layout Inspiration: Google Maps
+The GUI layout should be similar to Google Maps website layout:
+- **Full-screen map viewport** as the primary interface element
+- **Clean, modern design** with intuitive controls
