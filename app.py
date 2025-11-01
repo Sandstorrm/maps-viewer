@@ -26,7 +26,7 @@ UNCLAIMED_COLOR = "#A9A9A9"
 # Treat these as the center (0,0) of the map
 ORIGIN_X = 0
 ORIGIN_Z = 0
-CHUNK_BLOCK_SIZE = 8  # each cell is an 8×8 block chunk
+CHUNK_BLOCK_SIZE = 16  # each CSV cell is a chunk; each chunk = 16×16 blocks
 
 
 def get_palette(n: int) -> list:
@@ -178,185 +178,391 @@ def render_legend(legend: list):
     st.markdown(html, unsafe_allow_html=True)
 
 
+# ----------------- INSERT: preprocessing helpers (must be defined before sidebar/UI uses) -----------------
+@st.cache_data(show_spinner=False)
+def preprocess_map(
+    df: pd.DataFrame,
+    treat_empty: bool,
+    unloaded_tokens: set,
+    unclaimed_tokens: set,
+):
+    # Uppercase strings and build masks (returned as numpy for speed)
+    upper_df = df.astype(str).apply(lambda col: col.str.strip().str.upper())
+    is_empty_df = (
+        (upper_df == "")
+        if treat_empty
+        else pd.DataFrame(False, index=upper_df.index, columns=upper_df.columns)
+    )
+    is_unloaded_df = upper_df.isin(list(unloaded_tokens))
+    is_unclaimed_df = upper_df.isin(list(unclaimed_tokens))
+    unloaded_mask = (is_unloaded_df | is_empty_df).to_numpy()
+    unclaimed_mask = (is_unclaimed_df & ~is_unloaded_df).to_numpy()
+    return upper_df, unloaded_mask, unclaimed_mask
+
+
+@st.cache_data(show_spinner=False)
+def compute_claims_mask(
+    upper_df: pd.DataFrame,
+    unloaded_mask: np.ndarray,
+    unclaimed_mask: np.ndarray,
+    term: str,
+):
+    if not term:
+        h, w = upper_df.shape
+        return np.zeros((h, w), dtype=bool)
+    hits_df = upper_df.apply(
+        lambda col: col.str.contains(term, case=False, na=False, regex=False)
+    )
+    claims_mask = hits_df.to_numpy() & ~unloaded_mask & ~unclaimed_mask
+    return claims_mask
+
+
+# ----------------- END INSERT --------------------------------------------------------
+
 # UI
 st.title("Minecraft Factions Map Viewer")
 
 MAPS_DIR = Path(__file__).parent / "maps"
 csv_files = sorted(MAPS_DIR.glob("*.csv"))
 
-# NEW: sidebar controls
+# Session state for map select and search auto-zoom
+if "map_select" not in st.session_state:
+    st.session_state["map_select"] = 0
+if "search_term" not in st.session_state:
+    st.session_state["search_term"] = ""
+if "last_token" not in st.session_state:
+    st.session_state["last_token"] = None
+if "do_autozoom" not in st.session_state:
+    st.session_state["do_autozoom"] = False
+
 st.sidebar.title("Controls")
 if not csv_files:
     st.info("No CSV files found in the 'maps' folder next to this app.")
 else:
     map_names = [p.stem for p in csv_files]
-    sel_name = st.sidebar.selectbox("Map", map_names, index=0)
-    csv_path = next(p for p in csv_files if p.stem == sel_name)
 
-    term = st.sidebar.text_input("Search faction", "")
-    show_legend = st.sidebar.checkbox("Show legend", True)
-    show_grid = st.sidebar.checkbox("Gridlines", True)
-    highlight = st.sidebar.checkbox(
-        "Highlight matches", True, help="Yellow overlay on matching chunks"
+    st.sidebar.write(
+        "Select a map and/or search for a faction. If multiple maps contain matches, jump between them below."
     )
+    # Use session_state to drive the selectbox index instead of a keyed widget
+    current_idx = int(st.session_state.get("map_select", 0))
+    sel_idx = st.sidebar.selectbox(
+        "Map",
+        list(range(len(map_names))),
+        index=current_idx,
+        format_func=lambda i: map_names[i],
+    )
+    if sel_idx != current_idx:
+        st.session_state["map_select"] = sel_idx
+    sel_name = map_names[sel_idx]
+    csv_path = csv_files[sel_idx]
+
+    # Clear search BEFORE creating the text input
+    if st.sidebar.button("Clear search"):
+        st.session_state["search_term"] = ""
+        st.session_state["last_token"] = None
+        st.session_state["do_autozoom"] = False
+        st.rerun()
+
+    # Text input without key; synced with session_state
+    default_term = st.session_state.get("search_term", "")
+    term = st.sidebar.text_input(
+        "Search faction", value=default_term, placeholder="e.g., aj"
+    )
+    if term != default_term:
+        st.session_state["search_term"] = term
+    term_upper = term.strip().upper()
+
+    # grid toggle and highlight/dim controls
+    show_grid = st.sidebar.checkbox(
+        "Gridlines", True, help="Draws chunk boundaries over the image"
+    )
+    highlight = st.sidebar.checkbox("Highlight matches", True)
     dim_others = st.sidebar.checkbox(
-        "Dim non-matches", True, help="Darken non-matching chunks when searching"
+        "Dim non-matches", True, help="Dim other claimed factions when searching"
     )
 
-    # Use a fresh container per map to avoid element collisions
-    with st.container():
-        try:
-            # Pass the path directly so pandas can memory-map the file
-            df = load_map(csv_path, DELIMITER, HAS_HEADER)
-            if not HAS_HEADER:
-                df.columns = [f"C{c}" for c in range(df.shape[1])]
-
-            img, legend, factions, unloaded_mask, hover_text = build_image(
-                df,
-                UNLOADED_TOKENS,
-                UNCLAIMED_TOKENS,
-                TREAT_EMPTY_AS_UNLOADED,
-                int(ORIGIN_X),
-                int(ORIGIN_Z),
-            )
-
-            # Compute top-left anchor so that (ORIGIN_X, ORIGIN_Z) is at the map center
-            h, w = df.shape
-            s = CHUNK_BLOCK_SIZE
-            x0 = int(ORIGIN_X - (w * s) / 2)
-            y0 = int(ORIGIN_Z - (h * s) / 2)
-
-            # Build figure
-            lcol, rcol = st.columns([4, 1], vertical_alignment="top")
-            with lcol:
-                # Base map
-                h_img, w_img = img.shape[:2]
-                fig = go.Figure()
-                fig.add_trace(
-                    go.Image(
-                        z=img, x0=x0, y0=y0, dx=CHUNK_BLOCK_SIZE, dy=CHUNK_BLOCK_SIZE
+    # Scan all maps for matches
+    results = []
+    if term_upper:
+        for i, p in enumerate(csv_files):
+            try:
+                df_i = load_map(p, DELIMITER, HAS_HEADER)
+                upper_df_i, _, _ = preprocess_map(
+                    df_i, TREAT_EMPTY_AS_UNLOADED, UNLOADED_TOKENS, UNCLAIMED_TOKENS
+                )
+                mask_i_df = upper_df_i.apply(
+                    lambda col: col.str.contains(
+                        term, case=False, na=False, regex=False
                     )
                 )
+                count = int(mask_i_df.to_numpy().sum())
+                if count > 0:
+                    results.append((i, map_names[i], count))
+            except Exception:
+                pass
 
-                # Prepare search mask (case-insensitive)
-                if term:
-                    arr_upper = df.astype(str).applymap(lambda x: x.strip().upper())
-                    mask = arr_upper.applymap(
-                        lambda x: (
-                            term.strip().upper() in x if isinstance(x, str) else False
-                        )
-                    ).to_numpy()
-                else:
-                    mask = np.zeros((h_img, w_img), dtype=bool)
+        if results:
+            st.sidebar.markdown("Matches found in:")
+            for _, n, c in results:
+                st.sidebar.write(f"- {n} ({c})")
 
-                # Optional highlight overlay (yellow)
-                if highlight and mask.any():
-                    fig.add_trace(
-                        go.Heatmap(
-                            z=mask.astype(np.uint8),
-                            x0=x0,
-                            dx=CHUNK_BLOCK_SIZE,
-                            y0=y0,
-                            dy=CHUNK_BLOCK_SIZE,
-                            showscale=False,
-                            colorscale=[
-                                [0, "rgba(0,0,0,0)"],
-                                [1, "rgba(255,255,0,0.5)"],
-                            ],
-                            hoverinfo="skip",
-                        )
-                    )
+            idxs = [i for i, _, _ in results]
+            if st.sidebar.button("Jump to first match"):
+                st.session_state["map_select"] = idxs[0]
+                st.session_state["do_autozoom"] = True
+                st.rerun()
+            col_a, col_b = st.sidebar.columns(2)
+            with col_a:
+                if st.button("Prev map"):
+                    if sel_idx in idxs:
+                        pos = idxs.index(sel_idx)
+                        new_idx = idxs[pos - 1] if pos > 0 else idxs[-1]
+                    else:
+                        new_idx = idxs[-1]
+                    st.session_state["map_select"] = new_idx
+                    st.session_state["do_autozoom"] = True
+                    st.rerun()
+            with col_b:
+                if st.button("Next map"):
+                    if sel_idx in idxs:
+                        pos = idxs.index(sel_idx)
+                        new_idx = idxs[(pos + 1) % len(idxs)]
+                    else:
+                        new_idx = idxs[0]
+                    st.session_state["map_select"] = new_idx
+                    st.session_state["do_autozoom"] = True
+                    st.rerun()
+        else:
+            st.sidebar.info("No matches found in any map.")
 
-                # Optional dim overlay (darken non-matches)
-                if term and dim_others:
-                    inv = (~mask).astype(np.uint8)
-                    fig.add_trace(
-                        go.Heatmap(
-                            z=inv,
-                            x0=x0,
-                            dx=CHUNK_BLOCK_SIZE,
-                            y0=y0,
-                            dy=CHUNK_BLOCK_SIZE,
-                            showscale=False,
-                            colorscale=[[0, "rgba(0,0,0,0)"], [1, "rgba(0,0,0,0.35)"]],
-                            hoverinfo="skip",
-                        )
-                    )
+    # Auto-zoom token gating (once per map+term)
+    token = f"{sel_name}|{term_upper}"
+    if term_upper and st.session_state["last_token"] != token:
+        st.session_state["do_autozoom"] = True
+        st.session_state["last_token"] = token
 
-                # Transparent heatmap overlay to provide hover text + coords
+    # Render selected map
+    try:
+        df = load_map(csv_path, DELIMITER, HAS_HEADER)
+        if not HAS_HEADER:
+            df.columns = [f"C{c}" for c in range(df.shape[1])]
+
+        img, legend, factions, unloaded_mask, hover_text = build_image(
+            df,
+            UNLOADED_TOKENS,
+            UNCLAIMED_TOKENS,
+            TREAT_EMPTY_AS_UNLOADED,
+            int(ORIGIN_X),
+            int(ORIGIN_Z),
+        )
+
+        # Anchor top-left so center aligns with (0,0)
+        h, w = df.shape
+        s = CHUNK_BLOCK_SIZE
+        x0 = int(ORIGIN_X - (w * s) / 2)
+        y0 = int(ORIGIN_Z - (h * s) / 2)
+
+        # Preprocess and compute claims mask (cached)
+        upper_df, unloaded_mask_map, unclaimed_mask_map = preprocess_map(
+            df, TREAT_EMPTY_AS_UNLOADED, UNLOADED_TOKENS, UNCLAIMED_TOKENS
+        )
+        claims_mask = compute_claims_mask(
+            upper_df, unloaded_mask_map, unclaimed_mask_map, term
+        )
+
+        # Build figure
+        fig = go.Figure()
+        fig.add_trace(
+            go.Image(z=img, x0=x0, y0=y0, dx=CHUNK_BLOCK_SIZE, dy=CHUNK_BLOCK_SIZE)
+        )
+
+        # Compose overlay: use Heatmap traces so unclaimed/unloaded are never dimmed
+        # Dim non-matching claimed chunks (explicit mask excludes unloaded/unclaimed)
+        if term and dim_others:
+            dim_mask = (~claims_mask) & (~unloaded_mask_map) & (~unclaimed_mask_map)
+            if dim_mask.any():
                 fig.add_trace(
                     go.Heatmap(
-                        z=np.zeros((h_img, w_img), dtype=np.uint8),
+                        z=dim_mask.astype(np.uint8),
                         x0=x0,
                         dx=CHUNK_BLOCK_SIZE,
                         y0=y0,
                         dy=CHUNK_BLOCK_SIZE,
-                        text=hover_text,
-                        hovertemplate="Faction: %{text}<br>Block X: %{x}, Z: %{y}<extra></extra>",
                         showscale=False,
-                        colorscale=[[0, "rgba(0,0,0,0)"], [1, "rgba(0,0,0,0)"]],
-                        hoverongaps=False,
+                        colorscale=[[0, "rgba(0,0,0,0)"], [1, "rgba(0,0,0,0.60)"]],
+                        hoverinfo="skip",
                     )
                 )
 
-                # NEW: auto-zoom axes to matched chunks (if any)
-                if mask.any():
-                    ii, jj = np.where(mask)
-                    s = CHUNK_BLOCK_SIZE
-                    x_min = x0 + int(jj.min()) * s
-                    x_max = x0 + (int(jj.max()) + 1) * s
-                    y_min = y0 + int(ii.min()) * s
-                    y_max = y0 + (int(ii.max()) + 1) * s
-                    pad_x = (x_max - x_min) * 0.10
-                    pad_y = (y_max - y_min) * 0.10
-                    fig.update_xaxes(range=[x_min - pad_x, x_max + pad_x])
-                    # keep y reversed: larger first, then smaller
-                    fig.update_yaxes(
-                        autorange=False, range=[y_max + pad_y, y_min - pad_y]
+        # Highlight matches (yellow overlay)
+        if term and highlight and claims_mask.any():
+            fig.add_trace(
+                go.Heatmap(
+                    z=claims_mask.astype(np.uint8),
+                    x0=x0,
+                    dx=CHUNK_BLOCK_SIZE,
+                    y0=y0,
+                    dy=CHUNK_BLOCK_SIZE,
+                    showscale=False,
+                    colorscale=[[0, "rgba(0,0,0,0)"], [1, "rgba(255,255,0,0.85)"]],
+                    hoverinfo="skip",
+                )
+            )
+
+        # Hover overlay (kept as heatmap)
+        fig.add_trace(
+            go.Heatmap(
+                z=np.zeros((h, w), dtype=np.uint8),
+                x0=x0,
+                dx=CHUNK_BLOCK_SIZE,
+                y0=y0,
+                dy=CHUNK_BLOCK_SIZE,
+                text=hover_text,
+                hovertemplate="Faction: %{text}<br>Block X: %{x}, Z: %{y}<extra></extra>",
+                showscale=False,
+                colorscale=[[0, "rgba(0,0,0,0)"], [1, "rgba(0,0,0,0)"]],
+                hoverongaps=False,
+            )
+        )
+
+        # Gridlines as shapes, thinned to avoid too many lines
+        shapes = []
+        if show_grid:
+            grid_color = "rgba(255,255,255,0.15)"
+            # Cap total lines ~200
+            max_lines = 200
+            step = int(np.ceil(max(h, w) / max(1, max_lines // 2)))
+            step = max(1, step)
+
+            # Compute origin indices so stepped grid includes world 0
+            # world x at 0 corresponds to j_origin where x0 + j_origin*s == 0 => j_origin = -x0 / s
+            # clamp/round to integer
+            j_origin = int(round((-x0) / s))
+            i_origin = int(round((-y0) / s))
+            # starting offsets so the range(...) will hit the origin index
+            j_start = j_origin % step
+            i_start = i_origin % step
+
+            # vertical (start from j_start so one line lands at x==0)
+            for j in range(j_start, w + 1, step):
+                x = x0 + j * s
+                shapes.append(
+                    dict(
+                        type="line",
+                        x0=x,
+                        x1=x,
+                        y0=y0,
+                        y1=y0 + h * s,
+                        line=dict(color=grid_color, width=1),
+                        layer="above",
                     )
-
-                fig.update_layout(margin=dict(l=0, r=0, t=0, b=0), dragmode="pan")
-                fig.update_xaxes(
-                    visible=False,
-                    showgrid=show_grid,
-                    zeroline=False,
-                    constrain="domain",
-                    scaleanchor="y",
                 )
-                fig.update_yaxes(
-                    visible=False,
-                    showgrid=show_grid,
-                    zeroline=False,
-                    autorange="reversed" if not mask.any() else None,
-                )
-                st.plotly_chart(
-                    fig,
-                    use_container_width=True,
-                    config={
-                        "scrollZoom": True,
-                        "doubleClick": "reset",
-                        "displaylogo": False,
-                        "modeBarButtonsToAdd": [
-                            "zoom2d",
-                            "pan2d",
-                            "zoomIn2d",
-                            "zoomOut2d",
-                            "autoScale2d",
-                            "resetScale2d",
-                        ],
-                    },
+            # horizontal (start from i_start so one line lands at y==0)
+            for i in range(i_start, h + 1, step):
+                y = y0 + i * s
+                shapes.append(
+                    dict(
+                        type="line",
+                        x0=x0,
+                        x1=x0 + w * s,
+                        y0=y,
+                        y1=y,
+                        line=dict(color=grid_color, width=1),
+                        layer="above",
+                    )
                 )
 
-            with rcol:
-                if show_legend:
-                    render_legend(legend)
-                st.caption(
-                    "Map center is (0,0). Unloaded chunks are light gray. "
-                    "Each cell is an 8×8-block area; hover shows the NW corner block. "
-                    "Top-left of the CSV is the north-west corner."
+            # Add prominent origin axes at world coordinate (0,0) so grid is visually centered
+            # vertical line at x=0
+            shapes.append(
+                dict(
+                    type="line",
+                    x0=0,
+                    x1=0,
+                    y0=y0,
+                    y1=y0 + h * s,
+                    line=dict(color="rgba(0,184,255,0.95)", width=2),
+                    layer="above",
                 )
-                st.write(f"Map size: {df.shape[0]} rows × {df.shape[1]} cols")
-                st.write(f"Factions: {len(factions)}")
+            )
+            # horizontal line at y=0
+            shapes.append(
+                dict(
+                    type="line",
+                    x0=x0,
+                    x1=x0 + w * s,
+                    y0=0,
+                    y1=0,
+                    line=dict(color="rgba(0,184,255,0.95)", width=2),
+                    layer="above",
+                )
+            )
 
-        except Exception as e:
-            st.error(f"Failed to parse or render {csv_path.name}: {e}")
+        fig.update_layout(shapes=shapes)
+
+        # One-time auto-zoom to matched claims
+        if st.session_state.get("do_autozoom") and claims_mask.any():
+            ii, jj = np.where(claims_mask)
+            x_min = x0 + int(jj.min()) * s
+            x_max = x0 + (int(jj.max()) + 1) * s
+            y_min = y0 + int(ii.min()) * s
+            y_max = y0 + (int(ii.max()) + 1) * s
+            pad_x = (x_max - x_min) * 0.10
+            pad_y = (y_max - y_min) * 0.10
+            fig.update_xaxes(range=[x_min - pad_x, x_max + pad_x])
+            fig.update_yaxes(autorange=False, range=[y_max + pad_y, y_min - pad_y])
+            st.session_state["do_autozoom"] = False
+        else:
+            fig.update_yaxes(autorange="reversed")
+
+        fig.update_layout(
+            margin=dict(l=0, r=0, t=0, b=0),
+            dragmode="pan",
+            height=900,  # large/full-screen feel
+        )
+        fig.update_xaxes(
+            showgrid=False,
+            zeroline=False,
+            constrain="domain",
+            scaleanchor="y",
+            scaleratio=1,
+            showticklabels=False,
+            ticks="",
+        )
+        fig.update_yaxes(showgrid=False, zeroline=False, showticklabels=False, ticks="")
+
+        st.plotly_chart(
+            fig,
+            use_container_width=True,
+            config={
+                "scrollZoom": True,
+                "doubleClick": "reset",
+                "displaylogo": False,
+                "modeBarButtonsToAdd": [
+                    "zoom2d",
+                    "pan2d",
+                    "zoomIn2d",
+                    "zoomOut2d",
+                    "autoScale2d",
+                    "resetScale2d",
+                ],
+            },
+        )
+
+        # Sidebar legend — always present, collapsed
+        with st.sidebar.expander("Legend", expanded=False):
+            render_legend(legend)
+
+        # Info
+        st.caption(
+            "Map center is (0,0). Unloaded chunks are light gray. "
+            f"Each cell is an {CHUNK_BLOCK_SIZE}×{CHUNK_BLOCK_SIZE}-block area; hover shows the NW corner block. "
+            "Top-left of the CSV is the north-west corner."
+        )
+        st.write(
+            f"Map: {sel_name} — size: {df.shape[0]} rows × {df.shape[1]} cols — Factions: {len(factions)}"
+        )
+
+    except Exception as e:
+        st.error(f"Failed to parse or render {csv_path.name}: {e}")
